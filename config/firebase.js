@@ -5,17 +5,12 @@ const initializeFirebase = () => {
   try {
     // Check if Firebase is already initialized
     if (admin.apps.length === 0) {
-      // Check if we're using the JSON file (local development)
-      if (process.env.NODE_ENV === 'development') {
-        const path = require('path');
-        const serviceAccount = require(path.join(__dirname, '../firebase-service-account.json'));
+      // Check if environment variables are available (production)
+      if (process.env.FIREBASE_PROJECT_ID && 
+          process.env.FIREBASE_PRIVATE_KEY && 
+          process.env.FIREBASE_CLIENT_EMAIL) {
         
-        admin.initializeApp({
-          credential: admin.credential.cert(serviceAccount)
-        });
-        console.log('✅ Firebase Admin initialized with JSON file (development)');
-      } else {
-        // Production: Use environment variables
+        // Use environment variables
         admin.initializeApp({
           credential: admin.credential.cert({
             projectId: process.env.FIREBASE_PROJECT_ID,
@@ -23,7 +18,17 @@ const initializeFirebase = () => {
             clientEmail: process.env.FIREBASE_CLIENT_EMAIL
           })
         });
-        console.log('✅ Firebase Admin initialized with environment variables (production)');
+        console.log('✅ Firebase Admin initialized with environment variables');
+        
+      } else {
+        // Fallback to JSON file (local development)
+        const path = require('path');
+        const serviceAccount = require(path.join(__dirname, '../firebase-service-account.json'));
+        
+        admin.initializeApp({
+          credential: admin.credential.cert(serviceAccount)
+        });
+        console.log('✅ Firebase Admin initialized with JSON file (local development)');
       }
     }
   } catch (error) {
