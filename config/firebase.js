@@ -10,11 +10,22 @@ const initializeFirebase = () => {
           process.env.FIREBASE_PRIVATE_KEY && 
           process.env.FIREBASE_CLIENT_EMAIL) {
         
-        // Use environment variables
+        // Parse the private key - handle both formats
+        let privateKey = process.env.FIREBASE_PRIVATE_KEY;
+        
+        // Replace literal \n with actual newlines if they exist
+        privateKey = privateKey.replace(/\\n/g, '\n');
+        
+        // If the key doesn't start with BEGIN, it might be base64 encoded or malformed
+        if (!privateKey.includes('BEGIN PRIVATE KEY')) {
+          console.error('❌ Private key format is invalid');
+          throw new Error('FIREBASE_PRIVATE_KEY must contain BEGIN PRIVATE KEY header');
+        }
+        
         admin.initializeApp({
           credential: admin.credential.cert({
             projectId: process.env.FIREBASE_PROJECT_ID,
-            privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
+            privateKey: privateKey,
             clientEmail: process.env.FIREBASE_CLIENT_EMAIL
           })
         });
