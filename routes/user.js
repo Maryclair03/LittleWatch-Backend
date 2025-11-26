@@ -850,4 +850,47 @@ router.put('/fcm-token', authenticateToken, [
   }
 });
 
+// @route   PUT /api/user/notification-settings
+// @desc    Update user's notification preferences
+// @access  Private
+router.put('/notification-settings', authenticateToken, [
+  body('notificationEnabled').isBoolean().withMessage('notificationEnabled must be a boolean')
+], async (req, res) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({
+        success: false,
+        errors: errors.array()
+      });
+    }
+
+    const userId = req.user.userId;
+    const { notificationEnabled } = req.body;
+
+    console.log(`🔔 Updating notification settings for user ${userId}: ${notificationEnabled}`);
+
+    await pool.query(
+      'UPDATE users SET notification_enabled = $1, updated_at = CURRENT_TIMESTAMP WHERE user_id = $2',
+      [notificationEnabled, userId]
+    );
+
+    console.log(`✅ Notification settings updated successfully`);
+
+    res.json({
+      success: true,
+      message: 'Notification settings updated successfully',
+      data: {
+        notificationEnabled
+      }
+    });
+  } catch (error) {
+    console.error('Update notification settings error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to update notification settings'
+    });
+  }
+});
+
 module.exports = router;

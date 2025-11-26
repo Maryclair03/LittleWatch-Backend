@@ -678,7 +678,7 @@ router.post('/record', async (req, res) => {
       });
     }
 
-    // Get device info and ALL users linked to this device
+    // Get device info
     const deviceResult = await pool.query(
       `SELECT d.device_id, d.device_name 
        FROM devices d
@@ -697,15 +697,15 @@ router.post('/record', async (req, res) => {
     const deviceId = device.device_id;
     const deviceName = device.device_name || 'LittleWatch';
 
-    // Get ALL users who have this device linked
+    // Get ALL users who have this device linked AND have notifications enabled
     const usersResult = await pool.query(
-      `SELECT user_id, fcm_token, full_name 
+      `SELECT user_id, fcm_token, full_name, notification_enabled 
        FROM users 
        WHERE device_serial = $1`,
       [device_serial]
     );
 
-    console.log(`📱 Device: ${deviceName}, Linked Users: ${usersResult.rows.length}`);
+    console.log(`📱 Device: ${deviceName}, Total Linked Users: ${usersResult.rows.length}`);
 
     // Get threshold settings
     const thresholdResult = await pool.query(
@@ -721,7 +721,7 @@ router.post('/record', async (req, res) => {
       oxygen_min: 94
     };
 
-    // Check for alerts (same logic as before)
+    // Check for alerts
     let isAlert = false;
     let alertMessages = [];
 
@@ -790,26 +790,30 @@ router.post('/record', async (req, res) => {
       [battery_level, deviceId]
     );
 
-    // Send notifications to ALL linked users if alert detected
+    // Send notifications to users who have notifications enabled
+    let notificationsSent = 0;
+    let usersNotified = 0;
+
     if (isAlert && alertMessages.length > 0) {
-      console.log(`🚨 ${alertMessages.length} alert(s) detected for ${usersResult.rows.length} user(s)`);
+      console.log(`🚨 ${alertMessages.length} alert(s) detected`);
       
       for (const user of usersResult.rows) {
         const userId = user.user_id;
         const fcmToken = user.fcm_token;
+        const notificationEnabled = user.notification_enabled;
         
-        console.log(`👤 Notifying user ${user.full_name} (ID: ${userId})`);
+        console.log(`👤 User ${user.full_name} (ID: ${userId}), Notifications: ${notificationEnabled ? 'Enabled' : 'Disabled'}`);
         
         for (const alert of alertMessages) {
-          // Save notification for each user
+          // Always save notification to database (for history)
           await pool.query(
             `INSERT INTO notifications (user_id, device_id, type, title, message, icon, color, created_at) 
              VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)`,
             [userId, deviceId, alert.type, alert.title, alert.message, alert.icon, alert.color]
           );
 
-          // Send push notification if user has FCM token
-          if (fcmToken) {
+          // Only send push notification if user has notifications enabled
+          if (notificationEnabled && fcmToken) {
             console.log(`📲 Sending push to ${user.full_name}`);
             await sendPushNotification(
               fcmToken,
@@ -825,12 +829,15 @@ router.post('/record', async (req, res) => {
                 oxygen_saturation: oxygen_saturation.toString()
               }
             );
+            notificationsSent++;
+          } else if (!notificationEnabled) {
+            console.log(`🔕 Notifications disabled for ${user.full_name}`);
           } else {
-            console.log(`⚠️ No FCM token for user ${user.full_name}`);
+            console.log(`⚠️ No FCM token for ${user.full_name}`);
           }
         }
 
-        // Emit Socket.IO event to each user
+        // Always emit Socket.IO event (for real-time UI updates)
         const io = req.app.get('io');
         if (io) {
           io.to(`user_${userId}`).emit('vital_alert', {
@@ -840,6 +847,10 @@ router.post('/record', async (req, res) => {
             vitals: { heart_rate, temperature, oxygen_saturation, movement_status }
           });
         }
+
+        if (notificationEnabled) {
+          usersNotified++;
+        }
       }
     }
 
@@ -848,8 +859,9 @@ router.post('/record', async (req, res) => {
       message: 'Vital signs recorded',
       isAlert,
       alertCount: alertMessages.length,
-      notificationsSent: isAlert ? usersResult.rows.length * alertMessages.length : 0,
-      usersNotified: usersResult.rows.length
+      notificationsSaved: isAlert ? usersResult.rows.length * alertMessages.length : 0,
+      pushNotificationsSent: notificationsSent,
+      usersNotified: usersNotified
     });
   } catch (error) {
     console.error('Record vitals error:', error);
