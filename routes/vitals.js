@@ -660,6 +660,158 @@ const { pool } = require('../config/database');
 const { authenticateToken, verifyDeviceOwnership } = require('../middleware/auth');
 const { sendPushNotification } = require('../config/firebase');
 
+// ==================== SLEEP TRACKING HELPER FUNCTIONS ====================
+
+/**
+ * Process sleep status when vital signs are recorded
+ * Tracks when baby starts/stops sleeping and calculates duration
+ */
+async function processSleepTracking(deviceId, movementStatus, req) {
+  try {
+    const io = req.app.get('io');
+    
+    if (movementStatus === 'sleeping') {
+      // Check if there's an active sleep session
+      const activeSession = await pool.query(
+        `SELECT session_id, start_time FROM sleep_sessions 
+         WHERE device_id = $1 AND is_active = TRUE 
+         ORDER BY start_time DESC LIMIT 1`,
+        [deviceId]
+      );
+
+      if (activeSession.rows.length === 0) {
+        // Start new sleep session
+        const newSession = await pool.query(
+          `INSERT INTO sleep_sessions (device_id, start_time, is_active, duration_minutes)
+           VALUES ($1, CURRENT_TIMESTAMP, TRUE, 0)
+           RETURNING session_id, start_time`,
+          [deviceId]
+        );
+        
+        console.log(`😴 Started new sleep session for device ${deviceId}`);
+        
+        // EMIT REAL-TIME EVENT: Sleep started
+        if (io) {
+          io.emit('sleep_started', {
+            device_id: deviceId,
+            session_id: newSession.rows[0].session_id,
+            start_time: newSession.rows[0].start_time,
+            current_duration_minutes: 0
+          });
+          
+          // Also emit session update
+          io.emit('sleep_session_update', {
+            device_id: deviceId,
+            is_sleeping: true,
+            start_time: newSession.rows[0].start_time,
+            current_duration_minutes: 0
+          });
+        }
+      } else {
+        // Update duration of existing session (in minutes)
+        const sessionId = activeSession.rows[0].session_id;
+        const updateResult = await pool.query(
+          `UPDATE sleep_sessions 
+           SET duration_minutes = CEIL(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - start_time)) / 60),
+               updated_at = CURRENT_TIMESTAMP
+           WHERE session_id = $1
+           RETURNING duration_minutes`,
+          [sessionId]
+        );
+        
+        const currentDuration = parseInt(updateResult.rows[0].duration_minutes);
+        
+        // EMIT REAL-TIME EVENT: Sleep duration update
+        if (io) {
+          io.emit('sleep_duration_update', {
+            device_id: deviceId,
+            session_id: sessionId,
+            current_duration_minutes: currentDuration
+          });
+        }
+      }
+    } else {
+      // Baby is not sleeping - end any active session
+      const activeSession = await pool.query(
+        `SELECT session_id, start_time FROM sleep_sessions 
+         WHERE device_id = $1 AND is_active = TRUE 
+         ORDER BY start_time DESC LIMIT 1`,
+        [deviceId]
+      );
+
+      if (activeSession.rows.length > 0) {
+        const session = activeSession.rows[0];
+        
+        // Calculate final duration and end the session
+        const endResult = await pool.query(
+          `UPDATE sleep_sessions 
+           SET is_active = FALSE,
+               end_time = CURRENT_TIMESTAMP,
+               duration_minutes = CEIL(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - start_time)) / 60)
+           WHERE session_id = $1
+           RETURNING duration_minutes, start_time`,
+          [session.session_id]
+        );
+
+        const durationMinutes = endResult.rows[0].duration_minutes;
+        const sessionDate = new Date(endResult.rows[0].start_time).toISOString().split('T')[0];
+
+        console.log(`⏰ Ended sleep session for device ${deviceId}, duration: ${durationMinutes} minutes`);
+
+        // Update daily summary
+        await updateDailySleepSummary(deviceId, sessionDate, durationMinutes);
+
+        // EMIT REAL-TIME EVENTS: Sleep ended and data updated
+        if (io) {
+          io.emit('sleep_ended', {
+            device_id: deviceId,
+            session_id: session.session_id,
+            total_duration_minutes: durationMinutes,
+            end_time: new Date().toISOString()
+          });
+          
+          io.emit('sleep_data_updated', {
+            device_id: deviceId,
+            date: sessionDate
+          });
+          
+          // Emit session update to indicate not sleeping
+          io.emit('sleep_session_update', {
+            device_id: deviceId,
+            is_sleeping: false,
+            current_duration_minutes: 0
+          });
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Sleep tracking error:', error);
+    // Don't throw - sleep tracking errors shouldn't break vital recording
+  }
+}
+
+/**
+ * Update or create daily sleep summary
+ */
+async function updateDailySleepSummary(deviceId, date, durationMinutes) {
+  try {
+    await pool.query(
+      `INSERT INTO daily_sleep_summary (device_id, date, total_sleep_minutes, sleep_session_count, longest_session_minutes)
+       VALUES ($1, $2, $3, 1, $3)
+       ON CONFLICT (device_id, date) 
+       DO UPDATE SET 
+         total_sleep_minutes = daily_sleep_summary.total_sleep_minutes + $3,
+         sleep_session_count = daily_sleep_summary.sleep_session_count + 1,
+         longest_session_minutes = GREATEST(daily_sleep_summary.longest_session_minutes, $3),
+         updated_at = CURRENT_TIMESTAMP`,
+      [deviceId, date, durationMinutes]
+    );
+    console.log(`📊 Updated daily sleep summary for device ${deviceId} on ${date}`);
+  } catch (error) {
+    console.error('Error updating daily sleep summary:', error);
+  }
+}
+
 router.post('/record', async (req, res) => {
   try {
     const {
@@ -783,6 +935,10 @@ router.post('/record', async (req, res) => {
        VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP)`,
       [deviceId, heart_rate, temperature, oxygen_saturation, movement_status, isAlert]
     );
+
+    // ==================== SLEEP TRACKING ====================
+    // Process sleep status (this tracks sleep sessions automatically)
+    await processSleepTracking(deviceId, movement_status);
 
     // Update device status
     await pool.query(
@@ -1015,7 +1171,6 @@ router.get('/latest-by-serial/:deviceSerial', authenticateToken, async (req, res
   }
 });
 
-module.exports = router;
 // Continuation of routes/vitals.js
 // Add this to the end of routes_vitals_part1.js
 
@@ -1345,4 +1500,263 @@ router.get('/statistics/:serial', authenticateToken, async (req, res) => {
   }
 });
 
+// ==================== SLEEP DATA ROUTES ====================
+
+// @route   GET /api/vitals/sleep/data/:deviceSerial
+// @desc    Get sleep data for the past X days (for charts)
+// @access  Private
+router.get('/sleep/data/:deviceSerial', authenticateToken, async (req, res) => {
+  try {
+    const { deviceSerial } = req.params;
+    const days = parseInt(req.query.days) || 7;
+
+    // Get device_id
+    const deviceResult = await pool.query(
+      'SELECT device_id FROM devices WHERE device_serial = $1',
+      [deviceSerial]
+    );
+
+    if (deviceResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Device not found'
+      });
+    }
+
+    const deviceId = deviceResult.rows[0].device_id;
+
+    // Get daily sleep summaries
+    const sleepResult = await pool.query(
+      `SELECT 
+        date,
+        total_sleep_minutes,
+        ROUND(total_sleep_minutes / 60.0, 1) as total_sleep_hours,
+        sleep_session_count,
+        longest_session_minutes,
+        ROUND(longest_session_minutes / 60.0, 1) as longest_session_hours
+       FROM daily_sleep_summary
+       WHERE device_id = $1 
+         AND date >= CURRENT_DATE - INTERVAL '${days} days'
+       ORDER BY date ASC`,
+      [deviceId]
+    );
+
+    // Format data for the mobile app chart
+    const formattedData = sleepResult.rows.map(row => ({
+      date: new Date(row.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric' }),
+      hours: parseFloat(row.total_sleep_hours) || 0,
+      minutes: parseInt(row.total_sleep_minutes) || 0,
+      sessions: parseInt(row.sleep_session_count) || 0,
+      longestSessionHours: parseFloat(row.longest_session_hours) || 0
+    }));
+
+    res.json({
+      success: true,
+      data: formattedData
+    });
+  } catch (error) {
+    console.error('Error fetching sleep data:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch sleep data',
+      error: error.message
+    });
+  }
+});
+
+// @route   GET /api/vitals/sleep/statistics/:deviceSerial
+// @desc    Get sleep statistics (averages, min, max)
+// @access  Private
+router.get('/sleep/statistics/:deviceSerial', authenticateToken, async (req, res) => {
+  try {
+    const { deviceSerial } = req.params;
+    const days = parseInt(req.query.days) || 7;
+
+    // Get device_id
+    const deviceResult = await pool.query(
+      'SELECT device_id FROM devices WHERE device_serial = $1',
+      [deviceSerial]
+    );
+
+    if (deviceResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Device not found'
+      });
+    }
+
+    const deviceId = deviceResult.rows[0].device_id;
+
+    // Get statistics
+    const statsResult = await pool.query(
+      `SELECT 
+        COUNT(*) as total_days_tracked,
+        COALESCE(ROUND(AVG(total_sleep_minutes) / 60.0, 1), 0) as avg_sleep_hours,
+        COALESCE(ROUND(MAX(total_sleep_minutes) / 60.0, 1), 0) as max_sleep_hours,
+        COALESCE(ROUND(MIN(total_sleep_minutes) / 60.0, 1), 0) as min_sleep_hours,
+        COALESCE(SUM(sleep_session_count), 0) as total_sessions,
+        COALESCE(ROUND(AVG(longest_session_minutes) / 60.0, 1), 0) as avg_longest_session_hours
+       FROM daily_sleep_summary
+       WHERE device_id = $1 
+         AND date >= CURRENT_DATE - INTERVAL '${days} days'`,
+      [deviceId]
+    );
+
+    const stats = statsResult.rows[0];
+
+    res.json({
+      success: true,
+      data: {
+        daysTracked: parseInt(stats.total_days_tracked) || 0,
+        averageSleepHours: parseFloat(stats.avg_sleep_hours) || 0,
+        maxSleepHours: parseFloat(stats.max_sleep_hours) || 0,
+        minSleepHours: parseFloat(stats.min_sleep_hours) || 0,
+        totalSessions: parseInt(stats.total_sessions) || 0,
+        avgLongestSessionHours: parseFloat(stats.avg_longest_session_hours) || 0
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching sleep statistics:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch sleep statistics',
+      error: error.message
+    });
+  }
+});
+
+// @route   GET /api/vitals/sleep/current/:deviceSerial
+// @desc    Get current sleep status (is baby sleeping now?)
+// @access  Private
+router.get('/sleep/current/:deviceSerial', authenticateToken, async (req, res) => {
+  try {
+    const { deviceSerial } = req.params;
+
+    // Get device_id
+    const deviceResult = await pool.query(
+      'SELECT device_id FROM devices WHERE device_serial = $1',
+      [deviceSerial]
+    );
+
+    if (deviceResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Device not found'
+      });
+    }
+
+    const deviceId = deviceResult.rows[0].device_id;
+
+    // Check for active sleep session
+    const sessionResult = await pool.query(
+      `SELECT 
+        session_id,
+        start_time,
+        CEIL(EXTRACT(EPOCH FROM (CURRENT_TIMESTAMP - start_time)) / 60) as current_duration_minutes
+       FROM sleep_sessions
+       WHERE device_id = $1 AND is_active = TRUE
+       ORDER BY start_time DESC
+       LIMIT 1`,
+      [deviceId]
+    );
+
+    if (sessionResult.rows.length > 0) {
+      const session = sessionResult.rows[0];
+      res.json({
+        success: true,
+        isSleeping: true,
+        data: {
+          sessionId: session.session_id,
+          startTime: session.start_time,
+          currentDurationMinutes: parseInt(session.current_duration_minutes),
+          currentDurationHours: (parseInt(session.current_duration_minutes) / 60).toFixed(1)
+        }
+      });
+    } else {
+      res.json({
+        success: true,
+        isSleeping: false,
+        data: null
+      });
+    }
+  } catch (error) {
+    console.error('Error fetching current sleep status:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch current sleep status',
+      error: error.message
+    });
+  }
+});
+
+// @route   GET /api/vitals/sleep/sessions/:deviceSerial
+// @desc    Get all sleep sessions for a date range
+// @access  Private
+router.get('/sleep/sessions/:deviceSerial', authenticateToken, async (req, res) => {
+  try {
+    const { deviceSerial } = req.params;
+    const { date, days = 7 } = req.query;
+
+    // Get device_id
+    const deviceResult = await pool.query(
+      'SELECT device_id FROM devices WHERE device_serial = $1',
+      [deviceSerial]
+    );
+
+    if (deviceResult.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: 'Device not found'
+      });
+    }
+
+    const deviceId = deviceResult.rows[0].device_id;
+
+    let sessionsResult;
+    if (date) {
+      // Get sessions for specific date
+      sessionsResult = await pool.query(
+        `SELECT 
+          session_id,
+          start_time,
+          end_time,
+          duration_minutes,
+          ROUND(duration_minutes / 60.0, 1) as duration_hours,
+          is_active
+         FROM sleep_sessions
+         WHERE device_id = $1 AND DATE(start_time) = $2
+         ORDER BY start_time ASC`,
+        [deviceId, date]
+      );
+    } else {
+      // Get sessions for past X days
+      sessionsResult = await pool.query(
+        `SELECT 
+          session_id,
+          start_time,
+          end_time,
+          duration_minutes,
+          ROUND(duration_minutes / 60.0, 1) as duration_hours,
+          is_active
+         FROM sleep_sessions
+         WHERE device_id = $1 
+           AND start_time >= CURRENT_DATE - INTERVAL '${parseInt(days)} days'
+         ORDER BY start_time DESC`,
+        [deviceId]
+      );
+    }
+
+    res.json({
+      success: true,
+      data: sessionsResult.rows
+    });
+  } catch (error) {
+    console.error('Error fetching sleep sessions:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to fetch sleep sessions',
+      error: error.message
+    });
+  }
+});
 module.exports = router;
