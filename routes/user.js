@@ -483,11 +483,14 @@ router.post('/signup', [
       });
     }
 
-    // Store plain text password (NO BCRYPT - FOR TESTING ONLY)
+    // Hash the password
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    // Store hashed password
     const insertResult = await pool.query(
       `INSERT INTO users (full_name, email, password, phone_number, date_of_birth, gender, created_at, updated_at) 
        VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP) RETURNING user_id`,
-      [name, email, password, phoneNumber || null, dateOfBirth || null, gender || null]
+      [name, email, hashedPassword, phoneNumber || null, dateOfBirth || null, gender || null]
     );
 
     const userId = insertResult.rows[0].user_id;
@@ -516,6 +519,9 @@ router.post('/signup', [
   }
 });
 
+// @route   POST /api/user/login
+// @desc    Login user
+// @access  Public
 router.post('/login', [
   body('email').isEmail().withMessage('Valid email is required'),
   body('password').notEmpty().withMessage('Password is required')
@@ -540,8 +546,9 @@ router.post('/login', [
 
     const user = result.rows[0];
 
-    // Plain text comparison (NO BCRYPT - FOR TESTING ONLY)
-    if (password !== user.password) {
+    // Compare hashed password
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
 
