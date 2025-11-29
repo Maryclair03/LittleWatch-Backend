@@ -938,7 +938,7 @@ router.post('/record', async (req, res) => {
 
     // ==================== SLEEP TRACKING ====================
     // Process sleep status (this tracks sleep sessions automatically)
-    await processSleepTracking(deviceId, movement_status);
+    await processSleepTracking(deviceId, movement_status, req);
 
     // Update device status
     await pool.query(
