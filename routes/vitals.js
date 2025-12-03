@@ -136,7 +136,7 @@
 //     // Create notifications and send push notifications if alerts detected
 //     if (isAlert && alertMessages.length > 0) {
 //       console.log(`🚨 ${alertMessages.length} alert(s) detected for user ${userId}`);
-      
+
 //       for (const alert of alertMessages) {
 //         // Save to notifications table
 //         await promisePool.query(
@@ -669,7 +669,7 @@ const { sendPushNotification } = require('../config/firebase');
 async function processSleepTracking(deviceId, movementStatus, req) {
   try {
     const io = req.app.get('io');
-    
+
     if (movementStatus === 'sleeping') {
       // Check if there's an active sleep session
       const activeSession = await pool.query(
@@ -687,9 +687,9 @@ async function processSleepTracking(deviceId, movementStatus, req) {
            RETURNING session_id, start_time`,
           [deviceId]
         );
-        
+
         console.log(`😴 Started new sleep session for device ${deviceId}`);
-        
+
         // EMIT REAL-TIME EVENT: Sleep started
         if (io) {
           io.emit('sleep_started', {
@@ -698,7 +698,7 @@ async function processSleepTracking(deviceId, movementStatus, req) {
             start_time: newSession.rows[0].start_time,
             current_duration_minutes: 0
           });
-          
+
           // Also emit session update
           io.emit('sleep_session_update', {
             device_id: deviceId,
@@ -718,9 +718,9 @@ async function processSleepTracking(deviceId, movementStatus, req) {
            RETURNING duration_minutes`,
           [sessionId]
         );
-        
+
         const currentDuration = parseInt(updateResult.rows[0].duration_minutes);
-        
+
         // EMIT REAL-TIME EVENT: Sleep duration update
         if (io) {
           io.emit('sleep_duration_update', {
@@ -741,7 +741,7 @@ async function processSleepTracking(deviceId, movementStatus, req) {
 
       if (activeSession.rows.length > 0) {
         const session = activeSession.rows[0];
-        
+
         // Calculate final duration and end the session
         const endResult = await pool.query(
           `UPDATE sleep_sessions 
@@ -769,12 +769,12 @@ async function processSleepTracking(deviceId, movementStatus, req) {
             total_duration_minutes: durationMinutes,
             end_time: new Date().toISOString()
           });
-          
+
           io.emit('sleep_data_updated', {
             device_id: deviceId,
             date: sessionDate
           });
-          
+
           // Emit session update to indicate not sleeping
           io.emit('sleep_session_update', {
             device_id: deviceId,
@@ -877,54 +877,66 @@ router.post('/record', async (req, res) => {
     let isAlert = false;
     let alertMessages = [];
 
-    if (heart_rate < settings.heart_rate_min) {
+    // Heart rate
+    if (heart_rate < 80 || heart_rate > 170) {
       isAlert = true;
       alertMessages.push({
         type: 'critical',
-        title: 'Warning! Low Heart Rate Alert',
-        message: `${deviceName}: Heart rate is below normal (${heart_rate} BPM)`,
+        title: 'Critical! Heart Rate Alert',
+        message: `${deviceName}: Heart rate is critical (${heart_rate} BPM)`,
         icon: 'heart',
         color: '#FF5252'
       });
-    } else if (heart_rate > settings.heart_rate_max) {
+    } else if ((heart_rate >= 80 && heart_rate <= 89) || (heart_rate >= 161 && heart_rate <= 170)) {
       isAlert = true;
       alertMessages.push({
         type: 'warning',
-        title: 'Warning! High Heart Rate Alert',
-        message: `${deviceName}: Heart rate is above normal (${heart_rate} BPM)`,
+        title: 'Warning! Heart Rate Alert',
+        message: `${deviceName}: Heart rate is outside ideal range (${heart_rate} BPM)`,
         icon: 'heart',
         color: '#FF9800'
       });
     }
 
-    if (temperature < settings.temperature_min) {
+    // Temperature
+    if (temperature < 35.5 || temperature >= 38.0) {
+      isAlert = true;
+      alertMessages.push({
+        type: 'critical',
+        title: 'Critical! Temperature Alert',
+        message: `${deviceName}: Temperature is critical (${temperature}°C)`,
+        icon: 'thermometer',
+        color: '#FF5252'
+      });
+    } else if ((temperature >= 35.5 && temperature <= 35.9) || (temperature >= 37.6 && temperature <= 37.9)) {
       isAlert = true;
       alertMessages.push({
         type: 'warning',
-        title: 'Warning! Low Temperature Alert',
-        message: `${deviceName}: Temperature is below normal (${temperature}°C)`,
+        title: 'Warning! Temperature Alert',
+        message: `${deviceName}: Temperature is outside ideal range (${temperature}°C)`,
         icon: 'thermometer',
-        color: '#2196F3'
-      });
-    } else if (temperature > settings.temperature_max) {
-      isAlert = true;
-      alertMessages.push({
-        type: 'critical',
-        title: 'Warning! High Temperature Alert',
-        message: `${deviceName}: Temperature is above normal (${temperature}°C)`,
-        icon: 'thermometer',
-        color: '#FF5252'
+        color: '#FF9800'
       });
     }
 
-    if (oxygen_saturation < settings.oxygen_min) {
+    // Oxygen
+    if (oxygen_saturation < 90) {
       isAlert = true;
       alertMessages.push({
         type: 'critical',
-        title: 'Warning! Low Oxygen Alert',
-        message: `${deviceName}: Oxygen saturation is low (${oxygen_saturation}%)`,
+        title: 'Critical! Oxygen Alert',
+        message: `${deviceName}: Oxygen saturation is dangerously low (${oxygen_saturation}%)`,
         icon: 'water',
         color: '#FF5252'
+      });
+    } else if (oxygen_saturation >= 90 && oxygen_saturation <= 94) {
+      isAlert = true;
+      alertMessages.push({
+        type: 'warning',
+        title: 'Warning! Oxygen Alert',
+        message: `${deviceName}: Oxygen saturation is slightly low (${oxygen_saturation}%)`,
+        icon: 'water',
+        color: '#FF9800'
       });
     }
 
@@ -952,14 +964,14 @@ router.post('/record', async (req, res) => {
 
     if (isAlert && alertMessages.length > 0) {
       console.log(`🚨 ${alertMessages.length} alert(s) detected`);
-      
+
       for (const user of usersResult.rows) {
         const userId = user.user_id;
         const fcmToken = user.fcm_token;
         const notificationEnabled = user.notification_enabled;
-        
+
         console.log(`👤 User ${user.full_name} (ID: ${userId}), Notifications: ${notificationEnabled ? 'Enabled' : 'Disabled'}`);
-        
+
         for (const alert of alertMessages) {
           // Always save notification to database (for history)
           await pool.query(
