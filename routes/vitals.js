@@ -1281,38 +1281,45 @@ router.get('/history-by-serial/:serial', authenticateToken, async (req, res) => 
 
     const deviceId = deviceResult.rows[0].device_id;
 
-    // Calculate date range using Date.now() for reliable current timestamp
+    // Philippine timezone offset: UTC+8 (8 hours in milliseconds)
+    const PHILIPPINE_OFFSET_MS = 8 * 60 * 60 * 1000;
+
+    // Get current time adjusted for Philippine timezone
+    const nowUTC = Date.now();
+    const nowPhilippine = nowUTC + PHILIPPINE_OFFSET_MS;
+
+    // Calculate date range
     let start, end;
-    const now = Date.now();
 
     if (startDate && endDate) {
       start = new Date(startDate);
       end = new Date(endDate);
     } else if (period) {
-      end = new Date(now);
-      
+      end = new Date(nowPhilippine);
+
       switch (period) {
         case '24H':
-          start = new Date(now - 24 * 60 * 60 * 1000);
+          start = new Date(nowPhilippine - 24 * 60 * 60 * 1000);
           break;
         case '1W':
-          start = new Date(now - 7 * 24 * 60 * 60 * 1000);
+          start = new Date(nowPhilippine - 7 * 24 * 60 * 60 * 1000);
           break;
         case '1M':
-          start = new Date(now - 30 * 24 * 60 * 60 * 1000);
+          start = new Date(nowPhilippine - 30 * 24 * 60 * 60 * 1000);
           break;
         default:
-          start = new Date(now - 24 * 60 * 60 * 1000);
+          start = new Date(nowPhilippine - 24 * 60 * 60 * 1000);
       }
     } else {
       // Default to last 24 hours
-      end = new Date(now);
-      start = new Date(now - 24 * 60 * 60 * 1000);
+      end = new Date(nowPhilippine);
+      start = new Date(nowPhilippine - 24 * 60 * 60 * 1000);
     }
 
-    // Debug logging - check server time calculation
+    // Debug logging
     console.log('📅 Date range calculation:', {
-      serverTimeNow: new Date(now).toISOString(),
+      serverTimeUTC: new Date(nowUTC).toISOString(),
+      serverTimePhilippine: new Date(nowPhilippine).toISOString(),
       period: period || 'default 24H',
       start: start.toISOString(),
       end: end.toISOString()
