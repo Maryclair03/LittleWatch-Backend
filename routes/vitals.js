@@ -1250,6 +1250,9 @@ router.get('/history/:deviceId', authenticateToken, verifyDeviceOwnership, async
 // @route   GET /api/vitals/history-by-serial/:serial
 // @desc    Get vitals history by device serial with date range and pagination
 // @access  Private
+// @route   GET /api/vitals/history-by-serial/:serial
+// @desc    Get vitals history by device serial with date range and pagination
+// @access  Private
 router.get('/history-by-serial/:serial', authenticateToken, async (req, res) => {
   try {
     const { serial } = req.params;
@@ -1278,32 +1281,42 @@ router.get('/history-by-serial/:serial', authenticateToken, async (req, res) => 
 
     const deviceId = deviceResult.rows[0].device_id;
 
-    // Calculate date range
+    // Calculate date range using Date.now() for reliable current timestamp
     let start, end;
+    const now = Date.now();
+
     if (startDate && endDate) {
       start = new Date(startDate);
       end = new Date(endDate);
     } else if (period) {
-      end = new Date();
-      start = new Date();
+      end = new Date(now);
+      
       switch (period) {
         case '24H':
-          start.setHours(start.getHours() - 24);
+          start = new Date(now - 24 * 60 * 60 * 1000);
           break;
         case '1W':
-          start.setDate(start.getDate() - 7);
+          start = new Date(now - 7 * 24 * 60 * 60 * 1000);
           break;
         case '1M':
-          start.setMonth(start.getMonth() - 1);
+          start = new Date(now - 30 * 24 * 60 * 60 * 1000);
           break;
         default:
-          start.setHours(start.getHours() - 24);
+          start = new Date(now - 24 * 60 * 60 * 1000);
       }
     } else {
       // Default to last 24 hours
-      end = new Date();
-      start = new Date(Date.now() - 24 * 60 * 60 * 1000);
+      end = new Date(now);
+      start = new Date(now - 24 * 60 * 60 * 1000);
     }
+
+    // Debug logging - check server time calculation
+    console.log('📅 Date range calculation:', {
+      serverTimeNow: new Date(now).toISOString(),
+      period: period || 'default 24H',
+      start: start.toISOString(),
+      end: end.toISOString()
+    });
 
     // Calculate pagination
     const pageNum = parseInt(page) || 1;
@@ -1322,10 +1335,11 @@ router.get('/history-by-serial/:serial', authenticateToken, async (req, res) => 
         timestamp
       FROM vital_readings
       WHERE device_id = $1 
-        AND timestamp BETWEEN $2 AND $3
+        AND timestamp >= $2 
+        AND timestamp <= $3
       ORDER BY timestamp DESC
       LIMIT $4 OFFSET $5`,
-      [deviceId, start, end, limitNum, offset]
+      [deviceId, start.toISOString(), end.toISOString(), limitNum, offset]
     );
 
     const readings = readingsResult.rows;
@@ -1347,11 +1361,14 @@ router.get('/history-by-serial/:serial', authenticateToken, async (req, res) => 
           COUNT(*) as total_readings
         FROM vital_readings
         WHERE device_id = $1 
-          AND timestamp BETWEEN $2 AND $3`,
-        [deviceId, start, end]
+          AND timestamp >= $2 
+          AND timestamp <= $3`,
+        [deviceId, start.toISOString(), end.toISOString()]
       );
       summary = summaryResult.rows[0] || null;
     }
+
+    console.log(`📊 Found ${readings.length} readings for device ${serial} (${period || '24H'})`);
 
     return res.json({
       success: true,
