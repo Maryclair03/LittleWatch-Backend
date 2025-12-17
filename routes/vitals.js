@@ -4,6 +4,30 @@ const { promisePool } = require('../config/database');
 const { authenticateToken, verifyDeviceOwnership } = require('../middleware/auth');
 const { sendPushNotification } = require('../config/firebase'); // Add this
 
+// Helper function to check if current time is within quiet hours
+function checkQuietHours(notifSettings) {
+  if (!notifSettings.quiet_hours_enabled) {
+    return false;
+  }
+
+  const now = new Date();
+  const currentTime = now.getHours() * 60 + now.getMinutes(); // minutes since midnight
+
+  // Parse quiet hours (format: "HH:MM:SS")
+  const [startHour, startMin] = notifSettings.quiet_hours_start.split(':').map(Number);
+  const [endHour, endMin] = notifSettings.quiet_hours_end.split(':').map(Number);
+  
+  const startTime = startHour * 60 + startMin;
+  const endTime = endHour * 60 + endMin;
+
+  // Handle overnight quiet hours (e.g., 22:00 to 08:00)
+  if (startTime > endTime) {
+    return currentTime >= startTime || currentTime <= endTime;
+  }
+  
+  return currentTime >= startTime && currentTime <= endTime;
+}
+
 router.post('/record', async (req, res) => {
   try {
     const {
@@ -62,6 +86,22 @@ router.post('/record', async (req, res) => {
       temperature_min: 36.0,
       temperature_max: 37.8,
       oxygen_min: 94
+    };
+
+    // Get notification settings for throttling
+    const [notificationSettings] = await promisePool.query(
+      'SELECT * FROM notification_settings WHERE user_id = ?',
+      [userId]
+    );
+
+    const notifSettings = notificationSettings[0] || {
+      notification_interval_minutes: 5,
+      enable_push_notifications: true,
+      enable_critical_alerts: true,
+      enable_warning_alerts: true,
+      enable_info_alerts: true,
+      quiet_hours_enabled: false,
+      group_notifications: true
     };
 
     // Check for alerts
@@ -137,16 +177,53 @@ router.post('/record', async (req, res) => {
     if (isAlert && alertMessages.length > 0) {
       console.log(`🚨 ${alertMessages.length} alert(s) detected for user ${userId}`);
       
+      // Check quiet hours
+      const isQuietHours = await checkQuietHours(notifSettings);
+      
       for (const alert of alertMessages) {
-        // Save to notifications table
-        await promisePool.query(
-          `INSERT INTO notifications (user_id, device_id, type, title, message, icon, color) 
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
-          [userId, deviceId, alert.type, alert.title, alert.message, alert.icon, alert.color]
+        // Check if alert type is enabled
+        const isAlertTypeEnabled = 
+          (alert.type === 'critical' && notifSettings.enable_critical_alerts) ||
+          (alert.type === 'warning' && notifSettings.enable_warning_alerts) ||
+          (alert.type === 'info' && notifSettings.enable_info_alerts);
+
+        if (!isAlertTypeEnabled) {
+          console.log(`⏭️ Skipping ${alert.type} alert - disabled by user settings`);
+          continue;
+        }
+
+        // Check for recent similar notifications (throttling)
+        const [recentNotifications] = await promisePool.query(
+          `SELECT notification_id, created_at 
+           FROM notifications 
+           WHERE user_id = ? AND device_id = ? AND type = ? 
+           AND created_at > DATE_SUB(NOW(), INTERVAL ? MINUTE)
+           ORDER BY created_at DESC LIMIT 1`,
+          [userId, deviceId, alert.type, notifSettings.notification_interval_minutes]
         );
 
-        // Send push notification if user has FCM token
-        if (fcmToken) {
+        const shouldThrottle = recentNotifications.length > 0 && alert.type !== 'critical';
+        
+        if (shouldThrottle) {
+          console.log(`⏰ Throttling ${alert.type} notification - sent ${Math.round((Date.now() - new Date(recentNotifications[0].created_at)) / 60000)} minutes ago`);
+          continue;
+        }
+
+        // Determine if notification should be silent (during quiet hours or throttled)
+        const isSilent = isQuietHours && alert.type !== 'critical';
+        const priority = alert.type === 'critical' ? 3 : alert.type === 'warning' ? 2 : 1;
+
+        // Save to notifications table
+        await promisePool.query(
+          `INSERT INTO notifications (user_id, device_id, type, title, message, icon, color, is_silent, priority) 
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          [userId, deviceId, alert.type, alert.title, alert.message, alert.icon, alert.color, isSilent, priority]
+        );
+
+        // Send push notification if user has FCM token and push is enabled
+        const shouldSendPush = fcmToken && notifSettings.enable_push_notifications && !isSilent;
+        
+        if (shouldSendPush) {
           console.log(`📲 Sending push notification: ${alert.title}`);
           await sendPushNotification(
             fcmToken,
@@ -155,6 +232,7 @@ router.post('/record', async (req, res) => {
             {
               type: 'vital_alert',
               alertType: alert.type,
+              priority: priority.toString(),
               deviceId: deviceId.toString(),
               deviceName: deviceName,
               heart_rate: heart_rate.toString(),
@@ -162,8 +240,10 @@ router.post('/record', async (req, res) => {
               oxygen_saturation: oxygen_saturation.toString()
             }
           );
-        } else {
+        } else if (!fcmToken) {
           console.log('⚠️ No FCM token found for user, skipping push notification');
+        } else if (isSilent) {
+          console.log('🔕 Silent notification - quiet hours active');
         }
       }
 
