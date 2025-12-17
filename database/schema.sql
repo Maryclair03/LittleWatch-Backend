@@ -67,10 +67,14 @@ CREATE TABLE notifications (
     icon VARCHAR(50),
     color VARCHAR(20),
     is_read BOOLEAN DEFAULT FALSE,
+    is_silent BOOLEAN DEFAULT FALSE,
+    priority INT DEFAULT 1,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    dismissed_at TIMESTAMP NULL,
     FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
     FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE,
-    INDEX idx_user_notifications (user_id, is_read, created_at)
+    INDEX idx_user_notifications (user_id, is_read, created_at),
+    INDEX idx_notification_throttle (user_id, device_id, type, created_at)
 );
 
 -- Sleep patterns table
@@ -103,6 +107,25 @@ CREATE TABLE threshold_settings (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE,
     UNIQUE KEY unique_device_settings (device_id)
+);
+
+-- Notification settings table (throttling and preferences)
+CREATE TABLE notification_settings (
+    setting_id INT PRIMARY KEY AUTO_INCREMENT,
+    user_id INT NOT NULL,
+    notification_interval_minutes INT DEFAULT 5,
+    enable_push_notifications BOOLEAN DEFAULT TRUE,
+    enable_critical_alerts BOOLEAN DEFAULT TRUE,
+    enable_warning_alerts BOOLEAN DEFAULT TRUE,
+    enable_info_alerts BOOLEAN DEFAULT TRUE,
+    quiet_hours_enabled BOOLEAN DEFAULT FALSE,
+    quiet_hours_start TIME DEFAULT '22:00:00',
+    quiet_hours_end TIME DEFAULT '08:00:00',
+    group_notifications BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+    UNIQUE KEY unique_user_settings (user_id)
 );
 
 -- Activity log table
@@ -171,5 +194,16 @@ FOR EACH ROW
 BEGIN
     INSERT INTO threshold_settings (device_id)
     VALUES (NEW.device_id);
+END//
+DELIMITER ;
+
+-- Insert default notification settings trigger
+DELIMITER //
+CREATE TRIGGER after_user_insert
+AFTER INSERT ON users
+FOR EACH ROW
+BEGIN
+    INSERT INTO notification_settings (user_id)
+    VALUES (NEW.user_id);
 END//
 DELIMITER ;
