@@ -411,11 +411,11 @@ async function getLatestVitals(deviceSerial) {
         d.is_connected,
         d.device_name,
         d.firmware_version
-       FROM vital_readings vr
-       JOIN devices d ON vr.device_id = d.device_id
-       WHERE d.device_serial = $1
-       ORDER BY vr.timestamp DESC 
-       LIMIT 1`,
+      FROM vital_readings vr
+      JOIN devices d ON vr.device_id = d.device_id
+      WHERE d.device_serial = $1
+      ORDER BY vr.timestamp DESC 
+      LIMIT 1`,
       [deviceSerial]
     );
     
