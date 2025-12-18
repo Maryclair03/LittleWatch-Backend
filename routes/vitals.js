@@ -811,7 +811,6 @@ async function updateDailySleepSummary(deviceId, date, durationMinutes) {
     console.error('Error updating daily sleep summary:', error);
   }
 }
-
 router.post('/record', async (req, res) => {
   try {
     const {
@@ -832,7 +831,7 @@ router.post('/record', async (req, res) => {
 
     // ==================== GET DEVICE ====================
     const deviceResult = await pool.query(
-      `SELECT d.device_id, d.device_name, d.warning_count, d.critical_count
+      `SELECT d.device_id, d.device_name, d.warning_count, d.critical_count, d.consecutive_alert_count, d.alert_notified
        FROM devices d
        WHERE d.device_serial = $1`,
       [device_serial]
@@ -849,8 +848,13 @@ router.post('/record', async (req, res) => {
     const deviceId = device.device_id;
     const deviceName = device.device_name || 'LittleWatch';
 
+    // Track individual counts for reference
     let warningCount = device.warning_count || 0;
     let criticalCount = device.critical_count || 0;
+    // Track combined consecutive alerts (warning OR critical)
+    let consecutiveAlertCount = device.consecutive_alert_count || 0;
+    // Track if we already notified for this alert sequence
+    let alertNotified = device.alert_notified || false;
 
     // ==================== GET USERS ====================
     const usersResult = await pool.query(
@@ -878,79 +882,102 @@ router.post('/record', async (req, res) => {
     let isAlert = false;
     let alertMessages = [];
 
-    // Heart rate
-    if (heart_rate < 80 || heart_rate > 170) {
-      isAlert = true;
-      alertMessages.push({
-        type: 'critical',
-        title: 'Critical! Heart Rate Alert',
-        message: `${deviceName}: Heart rate is critical (${heart_rate} BPM)`,
-        icon: 'heart',
-        color: '#FF5252'
-      });
-    } else if ((heart_rate >= 80 && heart_rate <= 89) || (heart_rate >= 161 && heart_rate <= 170)) {
-      isAlert = true;
-      alertMessages.push({
-        type: 'warning',
-        title: 'Warning! Heart Rate Alert',
-        message: `${deviceName}: Heart rate is outside ideal range (${heart_rate} BPM)`,
-        icon: 'heart',
-        color: '#FF9800'
-      });
+    // Skip alert detection if vitals are 0 (no sensor contact)
+    const hasValidReadings = heart_rate > 0 || temperature > 0 || oxygen_saturation > 0;
+
+    if (hasValidReadings) {
+      // Heart rate alert detection
+      if (heart_rate > 0) {
+        if (heart_rate < 80 || heart_rate > 170) {
+          isAlert = true;
+          alertMessages.push({
+            type: 'critical',
+            title: 'Critical! Heart Rate Alert',
+            message: `${deviceName}: Heart rate is critical (${heart_rate} BPM)`,
+            icon: 'heart',
+            color: '#FF5252'
+          });
+        } else if ((heart_rate >= 80 && heart_rate <= 89) || (heart_rate >= 161 && heart_rate <= 170)) {
+          isAlert = true;
+          alertMessages.push({
+            type: 'warning',
+            title: 'Warning! Heart Rate Alert',
+            message: `${deviceName}: Heart rate is outside ideal range (${heart_rate} BPM)`,
+            icon: 'heart',
+            color: '#FF9800'
+          });
+        }
+      }
+
+      // Temperature alert detection
+      if (temperature > 0) {
+        if (temperature < 35.5 || temperature >= 38.0) {
+          isAlert = true;
+          alertMessages.push({
+            type: 'critical',
+            title: 'Critical! Temperature Alert',
+            message: `${deviceName}: Temperature is critical (${temperature}°C)`,
+            icon: 'thermometer',
+            color: '#FF5252'
+          });
+        } else if ((temperature >= 35.5 && temperature <= 35.9) || (temperature >= 37.6 && temperature <= 37.9)) {
+          isAlert = true;
+          alertMessages.push({
+            type: 'warning',
+            title: 'Warning! Temperature Alert',
+            message: `${deviceName}: Temperature is outside ideal range (${temperature}°C)`,
+            icon: 'thermometer',
+            color: '#FF9800'
+          });
+        }
+      }
+
+      // Oxygen alert detection
+      if (oxygen_saturation > 0) {
+        if (oxygen_saturation < 90) {
+          isAlert = true;
+          alertMessages.push({
+            type: 'critical',
+            title: 'Critical! Oxygen Alert',
+            message: `${deviceName}: Oxygen saturation is dangerously low (${oxygen_saturation}%)`,
+            icon: 'water',
+            color: '#FF5252'
+          });
+        } else if (oxygen_saturation >= 90 && oxygen_saturation <= 94) {
+          isAlert = true;
+          alertMessages.push({
+            type: 'warning',
+            title: 'Warning! Oxygen Alert',
+            message: `${deviceName}: Oxygen saturation is slightly low (${oxygen_saturation}%)`,
+            icon: 'water',
+            color: '#FF9800'
+          });
+        }
+      }
     }
 
-    // Temperature
-    if (temperature < 35.5 || temperature >= 38.0) {
-      isAlert = true;
-      alertMessages.push({
-        type: 'critical',
-        title: 'Critical! Temperature Alert',
-        message: `${deviceName}: Temperature is critical (${temperature}°C)`,
-        icon: 'thermometer',
-        color: '#FF5252'
-      });
-    } else if ((temperature >= 35.5 && temperature <= 35.9) || (temperature >= 37.6 && temperature <= 37.9)) {
-      isAlert = true;
-      alertMessages.push({
-        type: 'warning',
-        title: 'Warning! Temperature Alert',
-        message: `${deviceName}: Temperature is outside ideal range (${temperature}°C)`,
-        icon: 'thermometer',
-        color: '#FF9800'
-      });
-    }
-
-    // Oxygen
-    if (oxygen_saturation < 90) {
-      isAlert = true;
-      alertMessages.push({
-        type: 'critical',
-        title: 'Critical! Oxygen Alert',
-        message: `${deviceName}: Oxygen saturation is dangerously low (${oxygen_saturation}%)`,
-        icon: 'water',
-        color: '#FF5252'
-      });
-    } else if (oxygen_saturation >= 90 && oxygen_saturation <= 94) {
-      isAlert = true;
-      alertMessages.push({
-        type: 'warning',
-        title: 'Warning! Oxygen Alert',
-        message: `${deviceName}: Oxygen saturation is slightly low (${oxygen_saturation}%)`,
-        icon: 'water',
-        color: '#FF9800'
-      });
-    }
-
-    // ==================== DETERMINE ALERT LEVEL (NEW) ====================
+    // ==================== DETERMINE ALERT LEVEL ====================
     let alertLevel = 'normal';
 
-    if (alertMessages.some(a => a.type === 'critical')) {
+    const hasCritical = alertMessages.some(a => a.type === 'critical');
+    const hasWarning = alertMessages.some(a => a.type === 'warning');
+
+    if (hasCritical) {
       alertLevel = 'critical';
-    } else if (alertMessages.some(a => a.type === 'warning')) {
+    } else if (hasWarning) {
       alertLevel = 'warning';
     }
 
-    // ==================== UPDATE CONSECUTIVE COUNTERS (NEW) ====================
+    // ==================== UPDATE CONSECUTIVE COUNTERS ====================
+    console.log('=== ALERT DEBUG ===');
+    console.log('Received vitals:', { heart_rate, temperature, oxygen_saturation });
+    console.log('Alert messages:', alertMessages.map(a => ({ type: a.type, title: a.title })));
+    console.log('Has Critical:', hasCritical);
+    console.log('Has Warning:', hasWarning);
+    console.log('Alert Level:', alertLevel);
+    console.log('Previous counts - Warning:', warningCount, 'Critical:', criticalCount, 'Consecutive:', consecutiveAlertCount, 'Already Notified:', alertNotified);
+
+    // Update individual counts (for tracking purposes)
     if (alertLevel === 'critical') {
       criticalCount += 1;
       warningCount = 0;
@@ -962,12 +989,91 @@ router.post('/record', async (req, res) => {
       criticalCount = 0;
     }
 
+    // Update COMBINED consecutive alert count (warning OR critical)
+    if (alertLevel === 'critical' || alertLevel === 'warning') {
+      consecutiveAlertCount += 1;
+      // alertNotified stays the same (don't reset it here)
+    } else {
+      // Normal reading - reset ALL counters and notification flag
+      consecutiveAlertCount = 0;
+      alertNotified = false; // Reset so it can notify again next time it hits 5
+    }
+
+    console.log('New counts - Warning:', warningCount, 'Critical:', criticalCount, 'Consecutive:', consecutiveAlertCount, 'Already Notified:', alertNotified);
+    console.log('===================');
+
+    // ==================== NOTIFICATION TRIGGER ====================
+    // Notify ONLY when hitting exactly 5 consecutive alerts AND haven't notified yet for this sequence
+    const SHOULD_NOTIFY = consecutiveAlertCount >= 5 && !alertNotified;
+
+    let notificationsSent = 0;
+    let usersNotified = 0;
+
+    if (SHOULD_NOTIFY) {
+      // Mark as notified BEFORE sending (so we don't notify again)
+      alertNotified = true;
+
+      for (const user of usersResult.rows) {
+        // Check if user has notifications enabled (handle PostgreSQL boolean properly)
+        const isNotificationEnabled = user.notification_enabled === true || user.notification_enabled === 't' || user.notification_enabled === 'true';
+        
+        console.log(`📱 User ${user.user_id} - notification_enabled: ${user.notification_enabled} (${typeof user.notification_enabled}) -> isEnabled: ${isNotificationEnabled}`);
+
+        // Always save to notifications table (in-app notifications)
+        for (const alert of alertMessages) {
+          await pool.query(
+            `INSERT INTO notifications (user_id, device_id, type, title, message, icon, color, created_at) 
+             VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)`,
+            [user.user_id, deviceId, alert.type, alert.title, alert.message, alert.icon, alert.color]
+          );
+
+          // Only send PUSH notification if user has it enabled AND has FCM token
+          if (isNotificationEnabled && user.fcm_token) {
+            console.log(`🔔 Sending push notification to user ${user.user_id}`);
+            await sendPushNotification(
+              user.fcm_token,
+              alert.title,
+              alert.message,
+              {
+                type: 'vital_alert',
+                alertType: alert.type,
+                deviceId: deviceId.toString(),
+                deviceName,
+                heart_rate: heart_rate.toString(),
+                temperature: temperature.toString(),
+                oxygen_saturation: oxygen_saturation.toString()
+              }
+            );
+            notificationsSent++;
+          } else {
+            console.log(`🔕 Push notification SKIPPED for user ${user.user_id} - enabled: ${isNotificationEnabled}, fcm_token: ${user.fcm_token ? 'exists' : 'missing'}`);
+          }
+        }
+
+        // Socket.IO real-time alert (always send for in-app updates)
+        const io = req.app.get('io');
+        if (io) {
+          io.to(`user_${user.user_id}`).emit('vital_alert', {
+            deviceId,
+            deviceName,
+            alerts: alertMessages,
+            vitals: { heart_rate, temperature, oxygen_saturation, movement_status }
+          });
+        }
+
+        usersNotified++;
+      }
+    }
+
+    // ==================== UPDATE DEVICE ====================
     await pool.query(
       `UPDATE devices
        SET warning_count = $1,
-           critical_count = $2
-       WHERE device_id = $3`,
-      [warningCount, criticalCount, deviceId]
+           critical_count = $2,
+           consecutive_alert_count = $3,
+           alert_notified = $4
+       WHERE device_id = $5`,
+      [warningCount, criticalCount, consecutiveAlertCount, alertNotified, deviceId]
     );
 
     // ==================== SAVE VITALS ====================
@@ -987,64 +1093,22 @@ router.post('/record', async (req, res) => {
       [battery_level, deviceId]
     );
 
-    // ==================== NOTIFICATION TRIGGER (NEW RULE) ====================
-    const SHOULD_NOTIFY =
-      (alertLevel === 'critical' && criticalCount === 5) ||
-      (alertLevel === 'warning' && warningCount === 5);
-
-    let notificationsSent = 0;
-    let usersNotified = 0;
-
-    if (SHOULD_NOTIFY) {
-      for (const user of usersResult.rows) {
-        for (const alert of alertMessages) {
-          await pool.query(
-            `INSERT INTO notifications (user_id, device_id, type, title, message, icon, color, created_at) 
-             VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)`,
-            [user.user_id, deviceId, alert.type, alert.title, alert.message, alert.icon, alert.color]
-          );
-
-          if (user.notification_enabled && user.fcm_token) {
-            await sendPushNotification(
-              user.fcm_token,
-              alert.title,
-              alert.message,
-              {
-                type: 'vital_alert',
-                alertType: alert.type,
-                deviceId: deviceId.toString(),
-                deviceName,
-                heart_rate: heart_rate.toString(),
-                temperature: temperature.toString(),
-                oxygen_saturation: oxygen_saturation.toString()
-              }
-            );
-            notificationsSent++;
-          }
-        }
-
-        const io = req.app.get('io');
-        if (io) {
-          io.to(`user_${user.user_id}`).emit('vital_alert', {
-            deviceId,
-            deviceName,
-            alerts: alertMessages,
-            vitals: { heart_rate, temperature, oxygen_saturation, movement_status }
-          });
-        }
-
-        usersNotified++;
-      }
-    }
-
     res.json({
       success: true,
       message: 'Vital signs recorded',
       alertLevel,
       warningCount,
       criticalCount,
+      consecutiveAlertCount,
+      alertNotified,
       notificationTriggered: SHOULD_NOTIFY,
-      pushNotificationsSent: notificationsSent
+      pushNotificationsSent: notificationsSent,
+      // Debug info (remove in production)
+      debug: {
+        alertMessages: alertMessages.map(a => ({ type: a.type, title: a.title })),
+        hasCritical,
+        hasWarning
+      }
     });
 
   } catch (error) {

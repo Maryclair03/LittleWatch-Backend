@@ -578,13 +578,16 @@ router.post('/login', [
 // @route   GET /api/user/profile
 // @desc    Get user profile
 // @access  Private
+// @route   GET /api/user/profile
+// @desc    Get user profile
+// @access  Private
 router.get('/profile', authenticateToken, async (req, res) => {
   try {
     const userId = req.user.userId;
 
     const result = await pool.query(
       `SELECT user_id, full_name, email, phone_number, date_of_birth, 
-       gender, profile_picture, device_serial, created_at 
+       gender, profile_picture, device_serial, notification_enabled, created_at 
        FROM users WHERE user_id = $1`,
       [userId]
     );
