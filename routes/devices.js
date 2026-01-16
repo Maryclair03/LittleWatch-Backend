@@ -449,7 +449,7 @@ router.post('/register', authenticateToken, async (req, res) => {
       }
     });
   } catch (error) {
-    console.error('Device registration error:', error);
+    console.error('Device registration error', error);
     res.status(500).json({
       success: false,
       message: 'Failed to register device'
